@@ -1,0 +1,5 @@
+osm-raw/
+*.bak
+*.before-*
+node_modules/
+.DS_Store
