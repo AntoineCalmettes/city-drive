@@ -41,6 +41,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { Reflector } from 'three/addons/objects/Reflector.js';
 
 // ===== Réglages (modifiables) =====
 const CONFIG = {
@@ -1186,7 +1187,7 @@ function spawnBoat(b, rMin, rMax) {
   for (let tries = 0; tries < 40; tries++) {
     const a = Math.random() * 2 * Math.PI, r = rMin + Math.random() * (rMax - rMin);
     const x = pos.x + Math.cos(a) * r, z = pos.z + Math.sin(a) * r;
-    if (!isSea(x, z) || !isSea(x + 8, z) || !isSea(x - 8, z) || !isSea(x, z + 8) || !isSea(x, z - 8)) continue;
+    if (inPort(x, z) || !isSea(x, z) || !isSea(x + 8, z) || !isSea(x - 8, z) || !isSea(x, z + 8) || !isSea(x, z - 8)) continue;
     b.g.position.set(x, -0.4, z);
     b.on = b.g.visible = true;
     return;
@@ -1202,7 +1203,7 @@ function updateBoats(dt, time) {
     }
     const fx = Math.sin(b.yaw), fz = Math.cos(b.yaw);
     if (b.v > 0) {
-      if (isSea(p.x + fx * 12, p.z + fz * 12)) { p.x += fx * b.v * dt; p.z += fz * b.v * dt; }
+      if (isSea(p.x + fx * 12, p.z + fz * 12) && !inPort(p.x + fx * 12, p.z + fz * 12)) { p.x += fx * b.v * dt; p.z += fz * b.v * dt; }
       else b.yaw += 1.2 * dt; // la côte approche : on vire
     }
     const w = time * 1.3 + b.ph;
@@ -2174,6 +2175,412 @@ function updateLandmarks() {
   }
 }
 
+// ===== Vieux-Port : quais, pontons, Ombrière, Ferry Boat, marché aux poissons, boutiques =====
+// construit une fois quand les tuiles du bassin sont chargées ; positions relevées sur le masque mer
+const inPort = (x, z) => x > -900 && x < 0 && z > -120 && z < 250;
+const portTime = { value: 0 };
+const port = { on: false, built: false, g: new THREE.Group(), glow: [], lamps: null };
+// léger roulis + pilonnement des bateaux amarrés, calculé dans le shader à partir de la position de l'instance
+function bobMat(m) {
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uT = portTime;
+    sh.vertexShader = 'uniform float uT;\n' + sh.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
+#ifdef USE_INSTANCING
+  float ph = instanceMatrix[3].x * 0.37 + instanceMatrix[3].z * 0.61;
+  float rl = sin(uT * 1.1 + ph) * 0.05;
+  transformed.xy = mat2(cos(rl), sin(rl), -sin(rl), cos(rl)) * transformed.xy;
+  transformed.y += sin(uT * 1.3 + ph * 1.7) * 0.1;
+#endif`);
+  };
+  m.customProgramCacheKey = () => 'bob';
+  return m;
+}
+// bords du bassin : premier / dernier point d'eau sur une verticale (quai du Port au nord, Rive Neuve au sud)
+function shoreZ(x) {
+  let n = null, s = null;
+  for (let z = -130; z <= 250; z += 1) if (isSea(x, z)) { if (n === null) n = z; s = z; }
+  return [n, s];
+}
+function shoreX(z) { let e = null; for (let x = -200; x <= 0; x += 0.5) if (isSea(x, z)) e = x; return e; }
+// avance depuis le quai vers l'intérieur des terres jusqu'à toucher une façade
+function marchFacade(x, z, dx, dz) {
+  for (let d = 2; d < 80; d += 0.5) {
+    const px = x + dx * d, pz = z + dz * d, t = tileAt(px, pz);
+    if (t && t.ready && hitBuilding(t, px, pz, 0)) return [px - dx * 0.3, pz - dz * 0.3];
+  }
+  return null;
+}
+// point de façade + normale tournée vers l'eau, à partir de deux visées décalées de ±3 m le long du quai
+function facadeAt(x, z, dx, dz) {
+  const tx = -dz, tz = dx;
+  const a = marchFacade(x - tx * 3, z - tz * 3, dx, dz), b = marchFacade(x + tx * 3, z + tz * 3, dx, dz), m = marchFacade(x, z, dx, dz);
+  if (!m) return null;
+  let nx = -dx, nz = -dz;
+  if (a && b && Math.hypot(b[0] - a[0], b[1] - a[1]) > 3) {
+    const ex = b[0] - a[0], ez = b[1] - a[1], l = Math.hypot(ex, ez);
+    nx = ez / l; nz = -ex / l;
+    if (nx * -dx + nz * -dz < 0) { nx = -nx; nz = -nz; }
+    if (nx * -dx + nz * -dz < 0.6) { nx = -dx; nz = -dz; } // façade trop biaisée : on reste face au quai
+  }
+  return { x: m[0], z: m[1], nx, nz, ang: Math.atan2(nx, nz) };
+}
+
+// enseignes réelles du port (emplacements approximatifs), quai : N = quai du Port, E = quai des Belges, S = Rive Neuve
+const SHOPS = [
+  { q: 'N', at: -55, name: 'La Samaritaine', sub: 'Café · Brasserie', bg: '#1d3f6e', fg: '#f3d27a', cafe: true },
+  { q: 'N', at: -110, name: 'Le Miramar', sub: 'Bouillabaisse', bg: '#8c1c1c', fg: '#ffffff', cafe: true },
+  { q: 'N', at: -175, name: 'Savon de Marseille', sub: 'Savonnerie', bg: '#e8dfc6', fg: '#2e5a3a' },
+  { q: 'N', at: -215, name: 'Santons de Provence', sub: 'Artisanat', bg: '#c8692c', fg: '#fff6dc' },
+  { q: 'N', at: -265, name: 'La Caravelle', sub: 'Hôtel Belle-Vue', bg: '#0f4c4c', fg: '#ffe9a8', cafe: true },
+  { q: 'N', at: -430, name: 'Glacier', sub: 'Glaces artisanales', bg: '#f7c6d9', fg: '#7a2350' },
+  { q: 'N', at: -480, name: 'Bar-Tabac du Port', sub: 'Presse · Loto', bg: '#b0271f', fg: '#ffffff', cafe: true },
+  { q: 'N', at: -540, name: 'Pizzeria', sub: 'Feu de bois', bg: '#2f6b2f', fg: '#ffffff', cafe: true },
+  { q: 'N', at: -600, name: 'Chez Madie', sub: 'Les Galinettes', bg: '#1a2a4a', fg: '#f5f0e0', cafe: true },
+  { q: 'N', at: -665, name: 'Poissonnerie', sub: 'Pêche du jour', bg: '#2a6fa8', fg: '#ffffff' },
+  { q: 'E', at: -25, name: 'OM Café', sub: 'Droit au but', bg: '#2aa6df', fg: '#ffffff', cafe: true },
+  { q: 'E', at: 15, name: 'Office de Tourisme', sub: 'Marseille', bg: '#0b5394', fg: '#ffffff' },
+  { q: 'S', at: -110, name: 'Bar de la Marine', sub: 'depuis Pagnol', bg: '#14325c', fg: '#ffd966', cafe: true },
+  { q: 'S', at: -150, name: 'Navettes', sub: "Biscuits à la fleur d'oranger", bg: '#efe4c8', fg: '#7a4a1c' },
+  { q: 'S', at: -195, name: 'La Criée', sub: 'Théâtre National', bg: '#111111', fg: '#ff5a36' },
+  { q: 'S', at: -300, name: 'Glacier du Roi', sub: 'Sorbets', bg: '#ffe7a0', fg: '#a3471b' },
+  { q: 'S', at: -360, name: 'Pizzeria Chez Etienne', sub: 'au Panier', bg: '#7d1e1e', fg: '#ffffff', cafe: true },
+  { q: 'S', at: -440, name: 'Bistrot du Port', sub: 'Pastis · Tapas', bg: '#e0b23a', fg: '#3a2410', cafe: true },
+  { q: 'S', at: -520, name: 'Savon de Marseille', sub: 'Huile d\'olive 72 %', bg: '#5b7f4a', fg: '#fffbe6' },
+  { q: 'S', at: -600, name: 'Restaurant Le Ruhl', sub: 'Poissons grillés', bg: '#20304a', fg: '#e8d9a8', cafe: true },
+];
+const SIGN_W = 512, SIGN_H = 128, SIGN_ROWS = 12;
+const signTex = (() => {
+  const [c, g] = canvas2d(SIGN_W * 2, SIGN_H * SIGN_ROWS);
+  const draw = (k, name, sub, bg, fg) => {
+    const x = (k % 2) * SIGN_W, y = Math.floor(k / 2) * SIGN_H;
+    g.fillStyle = bg; g.fillRect(x, y, SIGN_W, SIGN_H);
+    g.strokeStyle = fg; g.lineWidth = 5; g.strokeRect(x + 8, y + 8, SIGN_W - 16, SIGN_H - 16);
+    g.fillStyle = fg; g.textAlign = 'center'; g.textBaseline = 'middle';
+    let fs = 64; g.font = `bold ${fs}px Georgia, serif`;
+    while (g.measureText(name).width > SIGN_W - 50 && fs > 26) g.font = `bold ${(fs -= 2)}px Georgia, serif`;
+    g.fillText(name, x + SIGN_W / 2, y + (sub ? 52 : 64));
+    if (sub) { g.font = 'italic 26px Georgia, serif'; g.fillText(sub, x + SIGN_W / 2, y + 98); }
+  };
+  SHOPS.forEach((s, k) => draw(k, s.name, s.sub, s.bg, s.fg));
+  draw(20, 'Marché aux poissons', 'Quai des Belges · tous les matins', '#1f5f99', '#ffffff');
+  draw(21, 'FERRY BOAT', 'depuis 1880', '#f2c230', '#183a6b');
+  draw(22, 'Frioul • Château d\'If', 'Navettes maritimes', '#0d3b66', '#ffffff');
+  draw(23, 'HÔTEL DE VILLE', 'Liberté · Égalité · Fraternité', '#e9dfc8', '#3a3328');
+  return canvasTex(c);
+})();
+const signMat = glow(new THREE.MeshLambertMaterial({ map: signTex, emissiveMap: signTex }), '#ffffff');
+function signGeo(k, w) {
+  const geo = new THREE.PlaneGeometry(w, w / 4), uv = geo.attributes.uv;
+  const u0 = (k % 2) * 0.5, v1 = 1 - Math.floor(k / 2) / SIGN_ROWS, v0 = v1 - 1 / SIGN_ROWS;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, u0 + uv.getX(i) * 0.5, v0 + uv.getY(i) * (v1 - v0));
+  return geo;
+}
+// store rayé aux couleurs de l'enseigne
+const stripeTex = (bg, alt) => {
+  const [c, g] = canvas2d(64, 8);
+  for (let k = 0; k < 8; k++) { g.fillStyle = k % 2 ? alt : bg; g.fillRect(k * 8, 0, 8, 8); }
+  const t = canvasTex(c); t.repeat.set(3, 1); return t;
+};
+
+// petit outil : instances groupées (géométrie + matériau) remplies au fil de la construction
+function batch(geo, mat, shadow = false) {
+  const list = [];
+  return {
+    list,
+    add(x, y, z, ry = 0, s = 1, col = null, sy = s) { list.push({ x, y, z, ry, s, sy, col }); },
+    make() {
+      if (!list.length) return null;
+      const im = new THREE.InstancedMesh(geo, mat, list.length), o = new THREE.Object3D();
+      list.forEach((p, i) => {
+        o.position.set(p.x, p.y, p.z); o.rotation.set(0, p.ry, 0); o.scale.set(p.s, p.sy, p.s); o.updateMatrix();
+        im.setMatrixAt(i, o.matrix);
+        if (p.col) im.setColorAt(i, C(p.col));
+      });
+      im.castShadow = shadow; im.receiveShadow = true; im.frustumCulled = false;
+      return im;
+    },
+  };
+}
+
+function buildPort() {
+  const G = port.g;
+  const stone = new THREE.MeshLambertMaterial({ color: 0xd8cdb4 });
+  const iron = new THREE.MeshLambertMaterial({ color: 0x26282b });
+  const wood = new THREE.MeshLambertMaterial({ color: 0x8a6b4a });
+  const white = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const lampMat = glow(new THREE.MeshLambertMaterial({ color: 0xfff2c8 }), '#ffd98a');
+  port.glow.push(lampMat, signMat);
+
+  // --- bord de quai : margelle en pierre, bittes d'amarrage, lampadaires ---
+  const cell = IDX.cell;
+  const coping = batch(new THREE.BoxGeometry(cell + 0.2, 0.5, 1.4), stone);
+  const bollard = batch(new THREE.CylinderGeometry(0.18, 0.24, 0.6, 8).translate(0, 0.3, 0), iron);
+  const post = batch(new THREE.CylinderGeometry(0.07, 0.11, 5, 6).translate(0, 2.5, 0), iron, true);
+  const lantern = batch(new THREE.BoxGeometry(0.45, 0.6, 0.45).translate(0, 5.2, 0), lampMat);
+  let edgeN = 0;
+  for (let z = -130; z < 250; z += cell) for (let x = -1000; x < -15; x += cell) {
+    const cx = x + cell / 2, cz = z + cell / 2;
+    if (isSea(cx, cz) || !tileAt(cx, cz)?.ready) continue;
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      if (!isSea(cx + dx * cell, cz + dz * cell)) continue;
+      const ex = cx + dx * (cell / 2 - 0.7), ez = cz + dz * (cell / 2 - 0.7), y = H(ex, ez);
+      const ry = dx ? Math.PI / 2 : 0;
+      coping.add(ex, y + 0.05, ez, ry);
+      edgeN++;
+      if (edgeN % 3 === 0) bollard.add(ex - dx * 0.3, y + 0.3, ez - dz * 0.3);
+      if (edgeN % 7 === 0) { post.add(ex - dx * 1.6, y, ez - dz * 1.6); lantern.add(ex - dx * 1.6, y, ez - dz * 1.6); }
+    }
+  }
+
+  // --- pontons et bateaux de plaisance amarrés en épi ---
+  const mastTall = new THREE.CylinderGeometry(0.05, 0.08, 12, 5).translate(0, 6.5, -0.6);
+  const boomGeo = new THREE.CylinderGeometry(0.12, 0.12, 3.6, 5).rotateX(Math.PI / 2).translate(0, 2.3, 0.9);
+  const cabinGeo = new THREE.BoxGeometry(1.7, 0.9, 2.4).translate(0, 1, 0.2);
+  const hulls = batch(hullGeo, bobMat(new THREE.MeshLambertMaterial({ color: 0xffffff })));
+  const decks = batch(deckGeo, bobMat(deckMat.clone()));
+  const cabins = batch(cabinGeo, bobMat(new THREE.MeshLambertMaterial({ color: 0xf2f2ee })));
+  const masts = batch(mastTall, bobMat(new THREE.MeshLambertMaterial({ color: 0xd9d9d9 })));
+  const booms = batch(boomGeo, bobMat(new THREE.MeshLambertMaterial({ color: 0x1f3d66 })));
+  const deckBoards = batch(new THREE.BoxGeometry(2.4, 0.3, 1), wood);
+  const HULLC = ['#f6f6f2', '#f6f6f2', '#f6f6f2', '#1f3a5c', '#e9e4d6', '#7a1f1f', '#f6f6f2', '#2c4f3a'];
+  const POINTU = ['#2a6fb8', '#d6402e', '#2f8f4e', '#f0c419', '#ffffff', '#1d3557'];
+  let seedP = 11;
+  const pr = () => (seedP = (seedP * 16807) % 2147483647) / 2147483647;
+  const moor = (x, z, yaw, s, col, sail) => {
+    const sea = (d) => isSea(x + Math.sin(yaw) * d * s, z + Math.cos(yaw) * d * s);
+    if (!isSea(x, z) || !sea(3.8) || !sea(-3.6)) return;
+    hulls.add(x, -0.35, z, yaw, s, col);
+    if (sail) { decks.add(x, -0.35, z, yaw, s); masts.add(x, -0.35, z, yaw, s); booms.add(x, -0.35, z, yaw, s); }
+    else cabins.add(x, -0.35, z, yaw, s);
+  };
+  const pontoon = (x, z0, z1) => {
+    const a = Math.min(z0, z1), b = Math.max(z0, z1);
+    for (let z = a; z < b; z += 1) deckBoards.add(x, -0.15, z + 0.5);
+    for (let z = a + 3; z < b - 1.5; z += 3.4) for (const side of [-1, 1]) {
+      if (pr() < 0.12) continue;
+      const s = 0.85 + pr() * 0.35;
+      moor(x + side * (1.3 + 3.4 * s), z, side > 0 ? -Math.PI / 2 : Math.PI / 2, s, HULLC[(pr() * HULLC.length) | 0], pr() < 0.6);
+    }
+  };
+  for (let x = -820; x <= -130; x += 42) {
+    if (x > -390 && x < -215) continue; // couloir du Ferry Boat
+    const [n, s] = shoreZ(x);
+    if (n === null || s - n < 90) continue;
+    const L = Math.min(60, (s - n) / 2 - 22);
+    pontoon(x, n + 0.5, n + 0.5 + L);
+    pontoon(x + 21, s - 0.5, s - 0.5 - L);
+  }
+  // pointus des pêcheurs le long du quai des Belges, proue vers le quai
+  for (let z = -40; z <= 24; z += 2.8) {
+    const e = shoreX(z);
+    if (e !== null) moor(e - 2.6, z, Math.PI / 2, 0.62, POINTU[(pr() * POINTU.length) | 0], false);
+  }
+  for (const bt of [hulls, decks, cabins, masts, booms, deckBoards, coping, bollard, post, lantern]) { const m = bt.make(); if (m) G.add(m); }
+
+  // --- l'Ombrière de Norman Foster : miroir de 46 × 22 m sur 8 piliers fins ---
+  {
+    const cz = 50, cx = (shoreX(cz) ?? -40) + 13, y = H(cx, cz) + 6;
+    const mirror = new Reflector(new THREE.PlaneGeometry(22, 46), { textureWidth: 512, textureHeight: 1024, color: 0xb8bcc0, clipBias: 0.003 });
+    mirror.rotation.x = Math.PI / 2;
+    mirror.position.set(cx, y - 0.16, cz);
+    const slab = new THREE.Mesh(new THREE.BoxGeometry(22.1, 0.3, 46.1), new THREE.MeshStandardMaterial({ color: 0xc9ccd0, metalness: 1, roughness: 0.15, envMap: carEnv }));
+    slab.position.set(cx, y, cz);
+    G.add(mirror, slab);
+    port.mirror = mirror;
+    const pil = new THREE.CylinderGeometry(0.14, 0.14, 6, 8).translate(0, 3, 0), pm = new THREE.MeshStandardMaterial({ color: 0xd0d3d6, metalness: 0.9, roughness: 0.3, envMap: carEnv });
+    for (const px of [-8, 8]) for (const pz of [-18, -6, 6, 18]) { const m = new THREE.Mesh(pil, pm); m.position.set(cx + px, y - 6, cz + pz); G.add(m); }
+  }
+
+  // --- marché aux poissons : étals bleus, caisses de glace et poissons, parasols ---
+  {
+    const stall = batch(new THREE.BoxGeometry(1.4, 0.9, 2.6).translate(0, 0.45, 0), new THREE.MeshLambertMaterial({ color: 0x2e6da4 }), true);
+    const ice = batch(new THREE.BoxGeometry(1.2, 0.12, 2.3).translate(0, 0.96, 0), new THREE.MeshLambertMaterial({ color: 0xeaf4fb }));
+    const fish = batch(new THREE.CapsuleGeometry(0.07, 0.35, 2, 6).rotateZ(Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0xaab4bd, metalness: 0.6, roughness: 0.35, envMap: carEnv }));
+    const umb = batch(new THREE.ConeGeometry(2, 0.7, 8, 1, true).translate(0, 3, 0), new THREE.MeshLambertMaterial({ color: 0xffffff, side: THREE.DoubleSide }), true);
+    const pole = batch(new THREE.CylinderGeometry(0.04, 0.04, 3, 5).translate(0, 1.5, 0), iron);
+    for (let i = 0; i < 6; i++) {
+      const z = -2 + i * 4.2, e = shoreX(z) ?? -33, x = e + 5, y = H(x, z);
+      stall.add(x, y, z); ice.add(x, y, z); pole.add(x + 1.2, y, z);
+      umb.add(x + 1.2, y, z, 0, 1, i % 2 ? '#2e6da4' : '#f4f4f4');
+      for (let k = 0; k < 9; k++) fish.add(x - 0.4 + (k % 3) * 0.4, y + 1.08, z - 0.8 + Math.floor(k / 3) * 0.8, 0.3 * (k % 2), 1);
+    }
+    for (const bt of [stall, ice, fish, umb, pole]) G.add(bt.make());
+    const e = shoreX(9) ?? -33, sx = e + 8.5, sy = H(sx, 9);
+    const sg = new THREE.Mesh(signGeo(20, 5), signMat); sg.position.set(sx, sy + 3, 9); sg.rotation.y = -Math.PI / 2;
+    const sp = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 3.6, 5).translate(0, 1.8, 0), iron); sp.position.set(sx + 0.1, sy, 9);
+    G.add(sg, sp);
+  }
+
+  // --- carrousel du quai des Belges ---
+  {
+    const cz = -45, cx = (shoreX(cz) ?? -60) + 13, y = H(cx, cz), car = new THREE.Group();
+    const [c, g] = canvas2d(256, 64);
+    for (let k = 0; k < 16; k++) { g.fillStyle = k % 2 ? '#f6efe0' : '#c0392b'; g.fillRect(k * 16, 0, 16, 64); }
+    g.fillStyle = '#d4a93a'; g.fillRect(0, 56, 256, 8);
+    const roofM = new THREE.MeshLambertMaterial({ map: canvasTex(c), side: THREE.DoubleSide });
+    const gold = glow(new THREE.MeshLambertMaterial({ color: 0xd4a93a }), '#ffcc66');
+    port.glow.push(gold);
+    car.add(new THREE.Mesh(new THREE.CylinderGeometry(5.2, 5.4, 0.6, 24).translate(0, 0.3, 0), new THREE.MeshLambertMaterial({ color: 0x7a2e2e })));
+    car.add(new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 5, 12).translate(0, 2.8, 0), gold));
+    car.add(new THREE.Mesh(new THREE.ConeGeometry(5.8, 2.2, 24, 1, true).translate(0, 6.4, 0), roofM));
+    car.add(new THREE.Mesh(new THREE.CylinderGeometry(5.8, 5.8, 0.6, 24, 1, true).translate(0, 5, 0), roofM));
+    const horseM = ['#f6f6f6', '#3b2a1e', '#c9a46b', '#f6f6f6'].map((h) => new THREE.MeshLambertMaterial({ color: h }));
+    const body = new THREE.BoxGeometry(0.5, 0.7, 1.6), head = new THREE.BoxGeometry(0.35, 0.8, 0.5).translate(0, 0.45, 0.75), rod = new THREE.CylinderGeometry(0.04, 0.04, 4.4, 5);
+    port.horses = [];
+    for (let k = 0; k < 12; k++) {
+      const a = (k / 12) * Math.PI * 2, r = k % 2 ? 3.9 : 2.7, h = new THREE.Group();
+      h.add(new THREE.Mesh(body, horseM[k % 4]), new THREE.Mesh(head, horseM[k % 4]));
+      const rd = new THREE.Mesh(rod, gold); rd.position.y = 1.2; h.add(rd);
+      h.position.set(Math.cos(a) * r, 1.6, Math.sin(a) * r); h.rotation.y = -a;
+      car.add(h); port.horses.push(h);
+    }
+    car.position.set(cx, y, cz);
+    G.add(car); port.carousel = car;
+  }
+
+  // --- navettes du Frioul / château d'If, à quai au sud du quai des Belges, et leur guichet ---
+  const bigBoat = (x, z, yaw, s, band) => {
+    const b = new THREE.Group();
+    const hull = new THREE.Mesh(hullGeo, white); hull.scale.set(s, 1.6, s); b.add(hull);
+    const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.7 * s, 0.25, 6.6 * s), new THREE.MeshLambertMaterial({ color: band })); stripe.position.y = 0.45; b.add(stripe);
+    const cab = new THREE.Mesh(new THREE.BoxGeometry(2 * s, 1.6, 3.6 * s), white); cab.position.set(0, 1.6, -0.3 * s); b.add(cab);
+    const win = new THREE.Mesh(new THREE.BoxGeometry(2 * s + 0.05, 0.6, 3.4 * s), new THREE.MeshLambertMaterial({ color: 0x24313d })); win.position.set(0, 1.9, -0.3 * s); b.add(win);
+    const top = new THREE.Mesh(new THREE.BoxGeometry(2.2 * s, 0.15, 4.2 * s), new THREE.MeshLambertMaterial({ color: band })); top.position.set(0, 2.5, -0.3 * s); b.add(top);
+    b.position.set(x, -0.3, z); b.rotation.y = yaw;
+    return b;
+  };
+  port.floaters = [];
+  for (const [z, band] of [[86, '#0d3b66'], [104, '#d1495b']]) {
+    const e = shoreX(z);
+    if (e === null) continue;
+    const b = bigBoat(e - 4.2, z, 0, 2.1, band); G.add(b); port.floaters.push(b);
+  }
+  {
+    const z = 95, e = shoreX(z) ?? -45, x = e + 6, y = H(x, z);
+    const k = new THREE.Mesh(new THREE.BoxGeometry(2.4, 2.6, 3.4).translate(0, 1.3, 0), new THREE.MeshLambertMaterial({ color: 0x0d3b66 }));
+    k.position.set(x, y, z); G.add(k);
+    const sg = new THREE.Mesh(signGeo(22, 4), signMat); sg.position.set(x - 1.25, y + 3.3, z); sg.rotation.y = -Math.PI / 2; G.add(sg);
+  }
+
+  // --- Ferry Boat : navette électrique entre l'Hôtel de Ville et la place aux Huiles ---
+  {
+    const [nA] = shoreZ(-357), [, sB] = shoreZ(-234);
+    const A = new THREE.Vector3(-357, -0.3, (nA ?? -95) + 6), B = new THREE.Vector3(-234, -0.3, (sB ?? 190) - 6);
+    const f = new THREE.Group();
+    const hullM = new THREE.MeshLambertMaterial({ color: 0xf4f1e8 }), yel = new THREE.MeshLambertMaterial({ color: 0xf2c230 });
+    const hull = new THREE.Mesh(new THREE.BoxGeometry(3.6, 1.1, 10).translate(0, 0, 0), hullM); f.add(hull);
+    for (const e of [-1, 1]) { const bw = new THREE.Mesh(new THREE.CylinderGeometry(1.8, 1.8, 1.1, 12, 1, false, 0, Math.PI).rotateY(e > 0 ? -Math.PI / 2 : Math.PI / 2), hullM); bw.position.z = e * 5; f.add(bw); }
+    const band = new THREE.Mesh(new THREE.BoxGeometry(3.7, 0.3, 10.1), new THREE.MeshLambertMaterial({ color: 0x183a6b })); band.position.y = 0.3; f.add(band);
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(3.8, 0.18, 7), yel); roof.position.y = 3; f.add(roof);
+    for (const px of [-1.6, 1.6]) for (const pz of [-3.2, 0, 3.2]) { const p = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 2.5, 5).translate(0, 1.75, 0), white); p.position.set(px, 0, pz); f.add(p); }
+    for (const e of [-1, 1]) { const sg = new THREE.Mesh(signGeo(21, 5), signMat); sg.position.set(e * 1.95, 2.55, 0); sg.rotation.y = e * Math.PI / 2; f.add(sg); }
+    const bench = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.5, 6), new THREE.MeshLambertMaterial({ color: 0x5a4632 })); bench.position.y = 0.8; f.add(bench);
+    f.position.copy(A); f.rotation.y = Math.atan2(B.x - A.x, B.z - A.z);
+    G.add(f);
+    port.ferry = { g: f, A, B };
+  }
+
+  // --- boutiques, cafés et terrasses sur les trois quais ---
+  {
+    const awnM = new Map();
+    const tables = batch(new THREE.CylinderGeometry(0.4, 0.4, 0.05, 10).translate(0, 0.74, 0), new THREE.MeshLambertMaterial({ color: 0xdedad2 }));
+    const legs = batch(new THREE.CylinderGeometry(0.04, 0.04, 0.74, 5).translate(0, 0.37, 0), iron);
+    const chairs = batch(new THREE.BoxGeometry(0.42, 0.85, 0.42).translate(0, 0.42, 0), new THREE.MeshLambertMaterial({ color: 0xffffff }));
+    const parasols = batch(new THREE.ConeGeometry(1.6, 0.5, 8, 1, true).translate(0, 2.4, 0), new THREE.MeshLambertMaterial({ color: 0xffffff, side: THREE.DoubleSide }), true);
+    const ppoles = batch(new THREE.CylinderGeometry(0.03, 0.03, 2.4, 5).translate(0, 1.2, 0), iron);
+    const awnGeo = new THREE.BoxGeometry(7.2, 0.06, 2.2).translate(0, 0, 1.1);
+    SHOPS.forEach((s, k) => {
+      let sx, sz, dx, dz;
+      if (s.q === 'E') { sz = s.at; sx = shoreX(sz); dx = 1; dz = 0; }
+      else {
+        sx = s.at; const [n, so] = shoreZ(sx);
+        sz = s.q === 'N' ? n : so; dx = 0; dz = s.q === 'N' ? -1 : 1;
+      }
+      if (sx === null || sz === null) return;
+      const f = facadeAt(sx, sz, dx, dz);
+      if (!f) return;
+      const y = H(f.x, f.z);
+      const sign = new THREE.Mesh(signGeo(k, 6.4), signMat);
+      sign.position.set(f.x + f.nx * 0.12, y + 4.6, f.z + f.nz * 0.12); sign.rotation.y = f.ang;
+      G.add(sign);
+      if (!awnM.has(s.bg)) awnM.set(s.bg, new THREE.MeshLambertMaterial({ map: stripeTex(s.bg, s.cafe ? '#f6f1e4' : s.fg) }));
+      const awn = new THREE.Mesh(awnGeo, awnM.get(s.bg));
+      awn.position.set(f.x + f.nx * 0.05, y + 3.6, f.z + f.nz * 0.05); awn.rotation.set(0, f.ang, 0); awn.rotateX(0.32);
+      awn.castShadow = true;
+      G.add(awn);
+      if (!s.cafe) return;
+      const tx = -f.nz, tz = f.nx; // le long de la façade
+      for (let i = -2; i <= 2; i++) for (const row of [2.6, 4.8]) {
+        const x = f.x + f.nx * row + tx * i * 1.9, z = f.z + f.nz * row + tz * i * 1.9;
+        if (isSea(x, z) || isSea(x + f.nx * 2, z + f.nz * 2)) continue;
+        const ty = H(x, z);
+        tables.add(x, ty, z); legs.add(x, ty, z);
+        chairs.add(x + tx * 0.55, ty, z + tz * 0.55, f.ang); chairs.add(x - tx * 0.55, ty, z - tz * 0.55, f.ang);
+        if ((i + 2) % 2 === 0 && row > 3) { parasols.add(x, ty, z, 0, 1, s.bg); ppoles.add(x, ty, z); }
+      }
+    });
+    for (const bt of [tables, legs, chairs, parasols, ppoles]) { const m = bt.make(); if (m) G.add(m); }
+  }
+
+  // --- Hôtel de Ville : enseigne et drapeaux sur la façade du quai du Port ---
+  {
+    const [n] = shoreZ(-357), f = n !== null && facadeAt(-357, n, 0, -1);
+    if (f) {
+      const y = H(f.x, f.z);
+      const sg = new THREE.Mesh(signGeo(23, 9), signMat); sg.position.set(f.x + f.nx * 0.15, y + 9.5, f.z + f.nz * 0.15); sg.rotation.y = f.ang; G.add(sg);
+      const [c, g] = canvas2d(96, 64);
+      g.fillStyle = '#002395'; g.fillRect(0, 0, 32, 64); g.fillStyle = '#ffffff'; g.fillRect(32, 0, 32, 64); g.fillStyle = '#ed2939'; g.fillRect(64, 0, 32, 64);
+      const fr = new THREE.MeshLambertMaterial({ map: canvasTex(c), side: THREE.DoubleSide });
+      const [c2, g2] = canvas2d(96, 64);
+      g2.fillStyle = '#003399'; g2.fillRect(0, 0, 96, 64); g2.fillStyle = '#ffcc00';
+      for (let k = 0; k < 12; k++) { const a = (k / 12) * Math.PI * 2; g2.beginPath(); g2.arc(48 + Math.cos(a) * 20, 32 + Math.sin(a) * 20, 3, 0, 7); g2.fill(); }
+      const eu = new THREE.MeshLambertMaterial({ map: canvasTex(c2), side: THREE.DoubleSide });
+      port.flags = [];
+      [[-3.5, fr], [3.5, eu]].forEach(([o, m]) => {
+        const tx = -f.nz, tz = f.nx, px = f.x + tx * o + f.nx * 0.3, pz = f.z + tz * o + f.nz * 0.3;
+        // hampe inclinée vers le quai, drapeau suspendu à son extrémité
+        const tilt = Math.PI / 2 - 0.6, up = Math.cos(tilt) * 3, out = Math.sin(tilt) * 3;
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 3, 5).translate(0, 1.5, 0).rotateX(tilt), iron);
+        pole.position.set(px, y + 11.5, pz); pole.rotation.y = f.ang; G.add(pole);
+        const flag = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1, 6, 1).translate(0.75, -0.5, 0), m);
+        flag.position.set(px + f.nx * out, y + 11.5 + up, pz + f.nz * out); flag.rotation.y = f.ang + Math.PI / 2; G.add(flag);
+        port.flags.push(flag);
+      });
+    }
+  }
+  port.built = true;
+}
+
+const portReady = () => [[-990, -125], [-990, 245], [-30, -125], [-30, 245], [-500, 60]].every(([x, z]) => tileAt(x, z)?.ready);
+function updatePort(dt, time) {
+  const ok = portReady();
+  if (ok && !port.built) buildPort();
+  if (ok && !port.on) { scene.add(port.g); port.on = true; }
+  else if (!ok && port.on) { scene.remove(port.g); port.on = false; }
+  if (!port.on) return;
+  portTime.value = time;
+  const near = Math.hypot(pos.x + 300, pos.z - 60) < 900;
+  port.g.visible = near;
+  if (!near) return;
+  if (port.mirror) port.mirror.visible = Math.hypot(pos.x - port.mirror.position.x, pos.z - port.mirror.position.z) < 350;
+  const lit = smooth(0.3, 0.8, night);
+  for (const m of port.glow) m.emissiveIntensity = lit * 0.8;
+  if (port.carousel) {
+    port.carousel.rotation.y += dt * 0.5;
+    port.horses.forEach((h, k) => { h.position.y = 1.6 + Math.sin(time * 2.4 + k * 1.3) * 0.35; });
+  }
+  for (const b of port.floaters) { b.position.y = -0.3 + Math.sin(time * 1.2 + b.position.z) * 0.08; b.rotation.z = Math.sin(time * 0.9 + b.position.z) * 0.025; }
+  if (port.flags) port.flags.forEach((f, k) => { f.rotation.x = Math.sin(time * 3 + k) * 0.15; });
+  // traversée : 20 s à quai, 70 s de traversée, dans un sens puis dans l'autre
+  if (port.ferry) {
+    const { g, A, B } = port.ferry, T = 180, u = time % T;
+    const leg = (v) => smooth(0, 1, v);
+    const k = u < 20 ? 0 : u < 90 ? leg((u - 20) / 70) : u < 110 ? 1 : 1 - leg((u - 110) / 70);
+    g.position.lerpVectors(A, B, k);
+    g.position.y = -0.3 + Math.sin(time * 1.4) * 0.06;
+  }
+}
+
 const worldClock = new THREE.Clock();
 function updateWorld(dt, fast) {
   const time = worldClock.getElapsedTime();
@@ -2184,6 +2591,7 @@ function updateWorld(dt, fast) {
   updateGulls(dt);
   updatePeds(dt, time);
   updateLandmarks();
+  updatePort(dt, time);
 }
 
 // ===== Boucle =====
