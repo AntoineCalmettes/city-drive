@@ -2,6 +2,8 @@
 
 Jeu de conduite three.js dans Marseille (données OpenStreetMap) : Ferrari, manette Xbox, vol (RB), jour/nuit, mouettes, piétons variés.
 
+**Jouer en ligne : https://antoinecalmettes.github.io/city-drive/marseille.html**
+
 ## Lancer
 
 ```sh
