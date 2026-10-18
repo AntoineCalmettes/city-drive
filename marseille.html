@@ -425,6 +425,8 @@ function pointInPoly(x, z, p) {
 let IDX, TILE, X0, Z0, CPT, KX, KZ;
 const tileSet = new Set(), tiles = new Map();
 const keyOf = (i, j) => i + '_' + j;
+const OMBRIERE = { x: -21.5, z: 50 }; // emprise OSM de l'Ombrière (taguée comme bâtiment)
+const inOmbriere = (x, z) => Math.abs(x - OMBRIERE.x) < 16 && Math.abs(z - OMBRIERE.z) < 26;
 const toXZ = (lat, lon) => [(lon - IDX.lon0) * KX, -(lat - IDX.lat0) * KZ];
 
 function buildTile(t, d) {
@@ -504,7 +506,7 @@ function buildTile(t, d) {
     const p = abs(raw), h = h10 / 10, n = p.length / 2;
     let cx = 0, cz = 0;
     for (let k = 0; k < p.length; k += 2) { cx += p[k]; cz += p[k + 1]; }
-    if (inLandmark(cx / n, cz / n)) continue; // remplacé par un modèle 3D
+    if (inLandmark(cx / n, cz / n) || inOmbriere(cx / n, cz / n)) continue; // remplacé par un modèle 3D
     const pal = WALLS[kind], wc = pal[Math.floor(rand() * pal.length)];
     let u = Math.floor(rand() * 4), y0 = 1e9;
     for (let k = 0; k < p.length; k += 2) y0 = Math.min(y0, hT(p[k], p[k + 1]));
@@ -2379,7 +2381,7 @@ function buildPort() {
 
   // --- l'Ombrière de Norman Foster : miroir de 46 × 22 m sur 8 piliers fins ---
   {
-    const cz = 50, cx = (shoreX(cz) ?? -40) + 13, y = H(cx, cz) + 6;
+    const cz = OMBRIERE.z, cx = OMBRIERE.x, y = H(cx, cz) + 6;
     const mirror = new Reflector(new THREE.PlaneGeometry(22, 46), { textureWidth: 512, textureHeight: 1024, color: 0xb8bcc0, clipBias: 0.003 });
     mirror.rotation.x = Math.PI / 2;
     mirror.position.set(cx, y - 0.16, cz);
